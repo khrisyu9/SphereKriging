@@ -37,6 +37,8 @@ import tensorflow as tf
 from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 np.random.seed(42)
 
@@ -76,6 +78,23 @@ def haversine_gc_distance_matrix(A_deg: np.ndarray, B_deg: np.ndarray, radius: f
     h = np.sin(dlat/2.0)**2 + np.cos(A_lat) * np.cos(B_lat) * np.sin(dlon/2.0)**2
     ang = 2.0 * np.arcsin(np.minimum(1.0, np.sqrt(h)))  # radians
     return radius * ang
+
+# --- NEW: chordal distance utils and metric switch ---
+
+def latlon_to_xyz(coords_deg: np.ndarray, radius: float = 1.0) -> np.ndarray:
+    lat = np.radians(coords_deg[:, 0])
+    lon = np.radians(coords_deg[:, 1])
+    x = radius * np.cos(lat) * np.cos(lon)
+    y = radius * np.cos(lat) * np.sin(lon)
+    z = radius * np.sin(lat)
+    return np.column_stack([x, y, z]).astype(np.float32)
+
+def chordal_distance_matrix(A_deg: np.ndarray, B_deg: np.ndarray, radius: float = 1.0) -> np.ndarray:
+    A = latlon_to_xyz(A_deg, radius=radius)
+    B = latlon_to_xyz(B_deg, radius=radius)
+    # Euclidean distance in R^3 (chord length)
+    D = np.linalg.norm(A[:, None, :] - B[None, :, :], axis=2)
+    return D.astype(np.float32)
 
 # ---------------------------------
 # Wendland C^4 (compact support)
@@ -131,67 +150,54 @@ def build_phi_wendland_sphere(
     theta_mult: float = 1.6,
     min_active: int = 8,
     max_auto_iters: int = 4,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Construct spherical multi-resolution RBF features using great-circle distance.
-
-    Args:
-        coords_deg: (N,2) lat/lon in degrees.
-        level_sizes: number of centers per resolution (coarse -> fine).
-        thetas: per-level range parameters in the same units as distance
-            (radians if radius=1). If None and auto_theta=True, choose
-            from center spacing; otherwise use a simple heuristic.
-        radius: sphere radius (1.0 -> radians; 6371 -> km distance scale).
-        auto_theta: if True, set theta_l = theta_mult * median(nearest-neighbor
-            distance among centers at level l) to ensure adequate overlap.
-        theta_mult: multiplicative factor for auto_theta.
-        min_active: try to ensure each sample activates at least `min_active` bases
-            across all levels (by inflating theta up to `max_auto_iters`).
-        max_auto_iters: maximum inflations by x1.2 if min_active not met.
+    metric: str = "geodesic",   # "geodesic" (original) or "chordal" (PD-safe)
+    return_per_level_stats: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """
+    Construct spherical multi-resolution RBF features.
 
     Returns:
-        phi: (N,K) design matrix, K=sum(level_sizes)
-        centers: (K,2) center coordinates in degrees
-        theta_vec: (K,) per-center theta actually used
+        phi: (N,K)
+        centers: (K,2) degrees
+        theta_vec: (K,)
+        stats: dict with coverage diagnostics (per-level activation, etc.)
     """
+    assert metric in ("geodesic", "chordal")
     centers = multires_spherical_centers(level_sizes, seed=seed)
     N = coords_deg.shape[0]
-    K = centers.shape[0]
-
-    # map centers to per-level ids
     level_ids = np.concatenate([np.full(n, i, dtype=int) for i, n in enumerate(level_sizes)])
 
-    # choose per-level ranges theta
+    # pick pairwise distance function
+    if metric == "geodesic":
+        dist_fn = lambda A, B: haversine_gc_distance_matrix(A, B, radius=radius)
+    else:
+        dist_fn = lambda A, B: chordal_distance_matrix(A, B, radius=radius)
+
+    # per-level theta
     if thetas is not None:
         assert len(thetas) == len(level_sizes)
         theta_levels = np.asarray(list(thetas), dtype=float)
     else:
-        if auto_theta:
-            # compute nearest-neighbor distances at each level
-            theta_levels = np.zeros(len(level_sizes), dtype=float)
-            offset = 0
-            for i, n in enumerate(level_sizes):
-                C_lvl = centers[offset:offset+n]
-                offset += n
-                if n == 1:
-                    # single global center: give very wide support
-                    theta_levels[i] = math.pi * 1.05
-                    continue
-                Dcc = haversine_gc_distance_matrix(C_lvl, C_lvl, radius=radius)
-                # ignore zeros on diagonal
+        theta_levels = np.zeros(len(level_sizes), dtype=float)
+        off = 0
+        for i, n in enumerate(level_sizes):
+            C_lvl = centers[off:off+n]; off += n
+            if n == 1:
+                # cover entire sphere
+                theta_levels[i] = (math.pi * 1.05 * radius) if metric == "geodesic" else (2.0 * radius * 1.05)
+            else:
+                Dcc = dist_fn(C_lvl, C_lvl)
                 Dcc = Dcc + np.eye(n) * 1e9
                 nn = Dcc.min(axis=1)
                 med_nn = float(np.median(nn))
                 theta_levels[i] = theta_mult * med_nn
-        else:
-            # fallback heuristic: theta_l = (pi/2)/sqrt(n_l)
-            theta_levels = np.array([(math.pi/2.0) / math.sqrt(n) for n in level_sizes], dtype=float)
 
     theta_vec = theta_levels[level_ids]
 
-    # pairwise great-circle distances (N x K)
-    D = haversine_gc_distance_matrix(coords_deg, centers, radius=radius)
+    # distances data->centers
+    D = dist_fn(coords_deg, centers)
 
-    # ensure coverage: inflate theta until each row has enough active bases
+    # coverage inflation
     inflate = 0
     active = (D <= theta_vec[None, :]).sum(axis=1)
     while active.min() < min_active and inflate < max_auto_iters:
@@ -199,24 +205,43 @@ def build_phi_wendland_sphere(
         active = (D <= theta_vec[None, :]).sum(axis=1)
         inflate += 1
 
-    # compute features with compact support
+    # features
     R = D / theta_vec[None, :]
     phi = wendland_c4(R).astype(np.float32)
-    return phi, centers, theta_vec
+
+    # optional per-level stats
+    stats = {}
+    if return_per_level_stats:
+        per_level = []
+        for li, n in enumerate(level_sizes):
+            mask = (level_ids == li)
+            act_l = (D[:, mask] <= theta_vec[mask][None, :]).sum(axis=1)
+            per_level.append({
+                "level": li,
+                "n_centers": int(n),
+                "theta": float(theta_levels[li]),
+                "active_min": int(act_l.min()),
+                "active_med": float(np.median(act_l)),
+                "active_mean": float(act_l.mean()),
+            })
+        stats["per_level"] = per_level
+        stats["active_overall_min"] = int(active.min())
+        stats["inflations"] = int(inflate)
+        stats["metric"] = metric
+
+    return phi, centers, theta_vec, stats
+
 
 # -------------------------
 # DeepKriging MLP head
 # -------------------------
 
-def make_deepkriging_head(input_dim: int, width: int = 50, depth: int = 3, lr: float = 1e-3) -> Sequential:
-    model = Sequential()
-    model.add(tf.keras.Input(shape=(input_dim,)))
-    model.add(Dense(width, activation='relu', kernel_initializer='he_normal'))
-    for _ in range(depth - 1):
-        model.add(Dense(width, activation='relu', kernel_initializer='he_normal'))
+def make_deepkriging_head(input_dim: int, width: int = 50, depth: int = 3, lr: float = 1e-3, l2w: float = 1e-5) -> Sequential:
+    model = Sequential([tf.keras.Input(shape=(input_dim,))])
+    for _ in range(depth):
+        model.add(Dense(width, activation='relu', kernel_initializer='he_normal', kernel_regularizer=l2(l2w)))
     model.add(Dense(1, activation='linear'))
-    opt = Adam(learning_rate=lr)
-    model.compile(loss='mse', optimizer=opt, metrics=['mse', 'mae'])
+    model.compile(loss='mse', optimizer=Adam(learning_rate=lr), metrics=['mse', 'mae'])
     return model
 
 # --------------------------------------
@@ -291,7 +316,7 @@ class Config:
     epochs: int = 60
     batch_size: int = 64
     # Output
-    results_dir: str = "./Results"
+    results_dir: str = "./Plots"
     save_plots: bool = True
     dpi: int = 300
 
@@ -316,7 +341,7 @@ def main(cfg: Config):
     )
 
     # 3) Build spherical DK features (great-circle + Wendland)
-    phi_sph, centers, theta_vec = build_phi_wendland_sphere(
+    phi_sph, centers, theta_vec, stats = build_phi_wendland_sphere(
         coords,
         level_sizes=cfg.level_sizes,
         thetas=cfg.thetas,
@@ -326,7 +351,10 @@ def main(cfg: Config):
         theta_mult=cfg.theta_mult,
         min_active=cfg.min_active,
         max_auto_iters=cfg.max_auto_iters,
+        metric="chordal",  # <--- PD-safe
+        return_per_level_stats=True  # diagnostics
     )
+
     F = phi_sph if X is None else np.hstack([X, phi_sph])
 
     # 4) Split and train
@@ -334,15 +362,19 @@ def main(cfg: Config):
         F, y, coords, test_size=cfg.test_size, random_state=cfg.seed
     )
 
-    model = make_deepkriging_head(F_tr.shape[1])
-    hist = model.fit(
-        F_tr,
-        y_tr,
-        validation_split=0.1,
-        epochs=cfg.epochs,
-        batch_size=cfg.batch_size,
-        verbose=0,
-    )
+    start_col = 1 if X is not None else 0
+    mu = F_tr[:, start_col:].mean(axis=0, keepdims=True)
+    sd = F_tr[:, start_col:].std(axis=0, keepdims=True) + 1e-8
+    F_tr[:, start_col:] = (F_tr[:, start_col:] - mu) / sd
+    F_te[:, start_col:] = (F_te[:, start_col:] - mu) / sd
+
+    model = make_deepkriging_head(F_tr.shape[1], width=50, depth=3, lr=1e-3, l2w=1e-5)
+    cbs = [
+        EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, min_lr=1e-5)
+    ]
+    hist = model.fit(F_tr, y_tr, validation_split=0.1, epochs=cfg.epochs, batch_size=cfg.batch_size, verbose=0,
+                     callbacks=cbs)
 
     # 5) Evaluate
     yhat = model.predict(F_te, verbose=0).ravel()
@@ -355,12 +387,12 @@ def main(cfg: Config):
     # coverage diagnostics
     D_dbg = haversine_gc_distance_matrix(coords, centers, radius=cfg.radius)
     active_dbg = (D_dbg <= theta_vec[None, :]).sum(axis=1)
-    print("Per-level theta (unique values; units match radius):")
-    print(np.unique(theta_vec, return_counts=True)[0])
-    print(
-        f"Active bases per point - min/median/mean: {active_dbg.min()}/"
-        f"{np.median(active_dbg):.1f}/{active_dbg.mean():.1f}"
-    )
+    print("Metric:", stats.get("metric", "geodesic"))
+    print("Per-level theta (units match chosen metric):", [pl["theta"] for pl in stats.get("per_level", [])])
+    for pl in stats.get("per_level", []):
+        print(
+            f"  L{pl['level']} (n={pl['n_centers']}): active min/med/mean = {pl['active_min']}/{pl['active_med']:.1f}/{pl['active_mean']:.1f}")
+    print(f"Overall active min = {stats.get('active_overall_min', 'NA')} (inflations={stats.get('inflations', 'NA')})")
     print(f"Test RMSE: {rmse:.4f} | MAE: {mae:.4f}")
     print(f"Elapsed: {t1 - t0:.1f}s")
 
@@ -399,7 +431,7 @@ def main(cfg: Config):
             f"{cfg.method_tag}_N{cfg.N}_L{cfg.L_max}_a{cfg.alpha}_nu{cfg.nu}_"
             f"sf{cfg.sigma_f}_sn{cfg.sigma_n}_lv-{levels_tag}_R{cfg.radius}_"
             f"aut{int(cfg.auto_theta)}_tm{cfg.theta_mult}_minA{cfg.min_active}_"
-            f"ep{cfg.epochs}_bs{cfg.batch_size}_seed{cfg.seed}.png"
+            f"ep{cfg.epochs}_bs{cfg.batch_size}_seed{cfg.seed}_metric_chordal.png"
         )
         out_path = os.path.join(cfg.results_dir, fname)
         fig.savefig(out_path, dpi=cfg.dpi, bbox_inches='tight')
