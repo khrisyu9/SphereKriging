@@ -9,7 +9,7 @@ cd SphereKriging
 ```
 ### 2️⃣ Create a new Conda environment
 ```
-conda create -n SphereKriging python=3.11
+conda create -n SphereKriging python=3.11.13
 conda activate SphereKriging
 ```
 ### 3️⃣ Install dependencies
