@@ -1,6 +1,6 @@
-## 🧩 Environment Setup
+## 🧩 Environment Setup and Code Test 🚀
 
-To reproduce the environment used for **SphereKriging**, follow the steps below.
+To reproduce the environment used for **SphereKriging** and run test code, follow the steps below.
 
 ### 1️⃣ Clone the repository
 ```
