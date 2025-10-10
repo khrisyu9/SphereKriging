@@ -4,7 +4,7 @@ To reproduce the environment used for **SphereKriging** and run test code, follo
 
 ### 1️⃣ Clone the repository
 ```
-git clone https://github.com/khrisyu9/SphereKriging.git
+git clone https://github.com/khrisyu9/SphereKriging
 cd SphereKriging
 ```
 ### 2️⃣ Create a new Conda environment
