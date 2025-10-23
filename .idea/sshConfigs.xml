@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig authType="PASSWORD" host="joltik.luddy.indiana.edu" id="a49493a9-ef84-4beb-b6d1-35d7a3f96d2b" port="22" nameFormat="DESCRIPTIVE" username="yyu3" useOpenSSHConfig="true" />
+    </configs>
+  </component>
+</project>

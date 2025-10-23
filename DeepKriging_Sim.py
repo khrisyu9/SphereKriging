@@ -55,12 +55,45 @@ np.random.seed(42)
 # Geometry + simulation helpers
 # -----------------------------
 
+# def uniform_points_on_sphere(n: int) -> np.ndarray:
+#     """Draw n points uniformly on the sphere -> (lat_deg, lon_deg)."""
+#     u = np.random.uniform(-1.0, 1.0, size=n)
+#     lon = np.random.uniform(-180.0, 180.0, size=n)
+#     lat = np.degrees(np.arcsin(u))
+#     return np.column_stack([lat, lon])
+
 def uniform_points_on_sphere(n: int) -> np.ndarray:
-    """Draw n points uniformly on the sphere -> (lat_deg, lon_deg)."""
-    u = np.random.uniform(-1.0, 1.0, size=n)
-    lon = np.random.uniform(-180.0, 180.0, size=n)
-    lat = np.degrees(np.arcsin(u))
+    """Draw n points uniformly on S^2 via Marsaglia -> (lat_deg, lon_deg)."""
+    a = np.empty(n, dtype=float)
+    b = np.empty(n, dtype=float)
+    k = 0
+    # Rejection sampling to fill (a,b) ~ Unif(unit disk)
+    while k < n:
+        # Oversample a bit; any factor >=1 works
+        m = max(1, n - k)
+        cand = np.random.uniform(-1.0, 1.0, size=(2*m, 2))
+        s = (cand**2).sum(axis=1)
+        keep = s < 1.0
+        if not np.any(keep):
+            continue
+        take = min(np.count_nonzero(keep), n - k)
+        sel = cand[keep][:take]
+        a[k:k+take] = sel[:, 0]
+        b[k:k+take] = sel[:, 1]
+        k += take
+
+    s = a*a + b*b
+    # Marsaglia map: (a,b) -> (x,y,z) on the unit sphere
+    w = np.sqrt(1.0 - s)
+    x = 2.0 * a * w
+    y = 2.0 * b * w
+    z = 1.0 - 2.0 * s
+
+    # Convert to (lat, lon) in degrees
+    lat = np.degrees(np.arcsin(z))           # [-90, 90]
+    lon = np.degrees(np.arctan2(y, x))       # (-180, 180]
     return np.column_stack([lat, lon])
+
 
 
 def latlon_to_colat_lon(coords_deg: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
